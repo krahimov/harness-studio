@@ -11,7 +11,7 @@
  * gets back a uniform {content, stop_reason, usage} shape.
  */
 
-import { generateText, type ModelMessage, type LanguageModel } from "ai";
+import { generateText, jsonSchema, type ModelMessage, type LanguageModel } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
@@ -349,6 +349,10 @@ class AISDKProvider implements LLMProvider {
     const model = instantiateModel(this.config, modelId);
     const messages = toModelMessages(params.messages);
 
+    // AI SDK v6 requires inputSchema be a parsed Schema (Zod or
+    // wrapped JSON Schema), not a raw JSON-Schema object. Without
+    // jsonSchema() the SDK throws "schema is not a function" inside
+    // prepareToolsAndToolChoice as soon as tools are passed.
     const toolsMap =
       params.tools && params.tools.length > 0
         ? Object.fromEntries(
@@ -356,7 +360,7 @@ class AISDKProvider implements LLMProvider {
               t.name,
               {
                 description: t.description,
-                inputSchema: t.input_schema,
+                inputSchema: jsonSchema(t.input_schema as never),
               },
             ]),
           )
