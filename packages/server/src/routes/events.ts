@@ -11,6 +11,7 @@ import { runAgentLoop, createSSEEmitter } from "../engine/index.js";
 import { createProvider } from "../providers/index.js";
 import { getProviderConfig } from "./providers.js";
 import { currentUser } from "../lib/current-user.js";
+import { getSandboxFactory } from "../sandbox/index.js";
 
 const tags = ["Events"];
 
@@ -239,6 +240,11 @@ export function registerEventRoutes(app: OpenAPIHono) {
           close() {},
         };
 
+        const sandboxFactory = await getSandboxFactory().catch((err) => {
+          console.error(`[events] failed to resolve sandbox factory:`, err);
+          return undefined;
+        });
+
         runAgentLoop(
           sessionId,
           agentConfig,
@@ -246,6 +252,7 @@ export function registerEventRoutes(app: OpenAPIHono) {
           emitter,
           20,
           organizationId,
+          sandboxFactory,
         ).catch((err) => {
           console.error(`Agent loop failed for session ${sessionId}:`, err);
         });

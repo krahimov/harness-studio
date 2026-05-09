@@ -208,7 +208,7 @@ describe("executeBuiltinTool MCP routing", () => {
     const result = await executeBuiltinTool(
       "__mcp__slack__send_message",
       { channel: "general", text: "hello" },
-      mcpRoutes,
+      { mcpRoutes },
     );
 
     expect(callToolStub).toHaveBeenCalledWith(
@@ -242,7 +242,7 @@ describe("executeBuiltinTool MCP routing", () => {
     const result = await executeBuiltinTool(
       "__mcp__slack__send_message",
       {},
-      mcpRoutes,
+      { mcpRoutes },
     );
 
     expect(result.is_error).toBe(true);
@@ -258,7 +258,7 @@ describe("executeBuiltinTool MCP routing", () => {
     const result = await executeBuiltinTool(
       "my_custom_tool",
       { param: "value" },
-      mcpRoutes,
+      { mcpRoutes },
     );
 
     // Should not have called callToolStub

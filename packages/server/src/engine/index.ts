@@ -19,6 +19,13 @@ import {
   callMCPTool,
   MCPClientError,
 } from "../lib/mcp-client.js";
+import type { Sandbox, SandboxFactory } from "../sandbox/index.js";
+import { truncateOutput } from "../sandbox/index.js";
+
+/** POSIX shell single-quote escape — safe for paths with spaces, quotes, etc. */
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
 
 export interface AgentConfig {
   name: string;
@@ -43,6 +50,71 @@ export interface SessionEventData {
 
 // Built-in tool definitions for the agent toolset
 const AGENT_TOOLS: ToolDefinition[] = [
+  {
+    name: "bash",
+    description:
+      "Execute a bash command in a sandboxed Linux environment. Use this to run scripts, inspect files, install packages, or test code. Returns combined stdout/stderr and exit code.",
+    input_schema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The bash command to execute." },
+        timeout_seconds: {
+          type: "number",
+          description: "Maximum seconds to wait. Default 60.",
+        },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "read_file",
+    description:
+      "Read the contents of a file in the sandbox filesystem. Returns the full file contents (truncated if very large).",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Path to the file. Absolute, or relative to the sandbox working directory.",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "write_file",
+    description:
+      "Write content to a file in the sandbox, overwriting if it exists. Creates parent directories if needed.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Destination path." },
+        content: { type: "string", description: "Full file content to write." },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit_file",
+    description:
+      "Replace text in a file. By default old_string must appear exactly once; pass replace_all=true to substitute every occurrence. Use to make targeted edits without rewriting the whole file.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file to edit." },
+        old_string: {
+          type: "string",
+          description: "Exact text to find. Whitespace-sensitive.",
+        },
+        new_string: { type: "string", description: "Replacement text." },
+        replace_all: {
+          type: "boolean",
+          description: "Replace every occurrence. Defaults to false.",
+        },
+      },
+      required: ["path", "old_string", "new_string"],
+    },
+  },
   {
     name: "web_search",
     description: "Search the web for information. Returns search results with titles, URLs, and snippets.",
@@ -77,6 +149,16 @@ interface MCPToolRoute {
   url: string;
   token: string | null;
   originalName: string;
+}
+
+/**
+ * Context passed to executeBuiltinTool. Carries the MCP routing table
+ * plus a getSandbox closure so the engine can lazily provision a
+ * sandbox only when a tool actually requests one.
+ */
+export interface ToolExecutionContext {
+  mcpRoutes?: Map<string, MCPToolRoute>;
+  getSandbox?: () => Promise<Sandbox>;
 }
 
 export interface ResolvedTools {
@@ -180,8 +262,9 @@ export async function resolveTools(
 export async function executeBuiltinTool(
   name: string,
   input: Record<string, unknown>,
-  mcpRoutes?: Map<string, MCPToolRoute>,
+  ctx?: ToolExecutionContext,
 ): Promise<{ content: string; is_error: boolean }> {
+  const mcpRoutes = ctx?.mcpRoutes;
   try {
     // ── Remote MCP tool ──────────────────────────────────────────
     if (name.startsWith("__mcp__") && mcpRoutes?.has(name)) {
@@ -213,6 +296,155 @@ export async function executeBuiltinTool(
           content: `MCP call failed (${route.connectorId}.${route.originalName}): ${msg}`,
           is_error: true,
         };
+      }
+    }
+
+    if (name === "bash") {
+      if (!ctx?.getSandbox) {
+        return {
+          content:
+            "bash tool unavailable: no sandbox factory configured. Set DAYTONA_API_KEY or run in a non-production environment.",
+          is_error: true,
+        };
+      }
+      const command = String((input as { command?: unknown }).command ?? "");
+      const timeoutSec = Number(
+        (input as { timeout_seconds?: unknown }).timeout_seconds ?? 60,
+      );
+      if (!command) {
+        return {
+          content: "bash: missing 'command' parameter.",
+          is_error: true,
+        };
+      }
+      const sandbox = await ctx.getSandbox();
+      const r = await sandbox.exec(command, { timeoutSec });
+      const parts: string[] = [];
+      if (r.stdout) parts.push(r.stdout);
+      if (r.stderr) parts.push(`[stderr]\n${r.stderr}`);
+      parts.push(`[exit code: ${r.exitCode}]`);
+      return {
+        content: parts.join("\n").trim(),
+        is_error: r.exitCode !== 0,
+      };
+    }
+
+    if (name === "read_file") {
+      if (!ctx?.getSandbox) {
+        return {
+          content: "read_file unavailable: no sandbox factory configured.",
+          is_error: true,
+        };
+      }
+      const path = String((input as { path?: unknown }).path ?? "");
+      if (!path) {
+        return { content: "read_file: missing 'path' parameter.", is_error: true };
+      }
+      try {
+        const sandbox = await ctx.getSandbox();
+        const content = await sandbox.readFile(path);
+        const { text } = truncateOutput(content);
+        return { content: text, is_error: false };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: `read_file failed: ${msg}`, is_error: true };
+      }
+    }
+
+    if (name === "write_file") {
+      if (!ctx?.getSandbox) {
+        return {
+          content: "write_file unavailable: no sandbox factory configured.",
+          is_error: true,
+        };
+      }
+      const path = String((input as { path?: unknown }).path ?? "");
+      const content = String((input as { content?: unknown }).content ?? "");
+      if (!path) {
+        return { content: "write_file: missing 'path' parameter.", is_error: true };
+      }
+      try {
+        const sandbox = await ctx.getSandbox();
+        // Ensure parent dir exists. Last slash defines the dir; if there
+        // isn't one, the file lives at the sandbox root and we skip mkdir.
+        const lastSlash = path.lastIndexOf("/");
+        if (lastSlash > 0) {
+          const dir = path.slice(0, lastSlash);
+          await sandbox.exec(`mkdir -p ${shellEscape(dir)}`);
+        }
+        await sandbox.writeFile(path, content);
+        return {
+          content: `Wrote ${content.length} bytes to ${path}`,
+          is_error: false,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: `write_file failed: ${msg}`, is_error: true };
+      }
+    }
+
+    if (name === "edit_file") {
+      if (!ctx?.getSandbox) {
+        return {
+          content: "edit_file unavailable: no sandbox factory configured.",
+          is_error: true,
+        };
+      }
+      const path = String((input as { path?: unknown }).path ?? "");
+      const oldString = String((input as { old_string?: unknown }).old_string ?? "");
+      const newString = String((input as { new_string?: unknown }).new_string ?? "");
+      const replaceAll = Boolean(
+        (input as { replace_all?: unknown }).replace_all ?? false,
+      );
+      if (!path) {
+        return { content: "edit_file: missing 'path' parameter.", is_error: true };
+      }
+      if (!oldString) {
+        return {
+          content: "edit_file: missing 'old_string' parameter.",
+          is_error: true,
+        };
+      }
+      try {
+        const sandbox = await ctx.getSandbox();
+        const original = await sandbox.readFile(path);
+        let updated: string;
+        let occurrences: number;
+        if (replaceAll) {
+          // Cheap occurrence count without regex (avoids escaping).
+          occurrences = original.split(oldString).length - 1;
+          if (occurrences === 0) {
+            return {
+              content: `edit_file: old_string not found in ${path}`,
+              is_error: true,
+            };
+          }
+          updated = original.split(oldString).join(newString);
+        } else {
+          const first = original.indexOf(oldString);
+          if (first === -1) {
+            return {
+              content: `edit_file: old_string not found in ${path}`,
+              is_error: true,
+            };
+          }
+          if (original.indexOf(oldString, first + oldString.length) !== -1) {
+            return {
+              content: `edit_file: old_string appears multiple times in ${path}. Add surrounding context to make it unique, or pass replace_all=true.`,
+              is_error: true,
+            };
+          }
+          updated = original.replace(oldString, newString);
+          occurrences = 1;
+        }
+        await sandbox.writeFile(path, updated);
+        return {
+          content: `Edited ${path} (${occurrences} replacement${occurrences === 1 ? "" : "s"})`,
+          is_error: false,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: `edit_file failed: ${msg}`, is_error: true };
       }
     }
 
@@ -401,9 +633,28 @@ export async function runAgentLoop(
   emitter?: SessionEventEmitter,
   maxIterations = 20,
   organizationId = "org_default",
+  sandboxFactory?: SandboxFactory,
 ): Promise<void> {
   const { tools, mcpRoutes } = await resolveTools(agentConfig, organizationId);
   let iteration = 0;
+
+  // Lazily-provisioned sandbox: created the first time a tool actually
+  // calls getSandbox(), torn down in the finally below.
+  // KNOWN LIMITATION: state does not persist across turns in a session
+  // — each runAgentLoop invocation gets its own. Follow-up PR: store
+  // sandbox_id on the session row and reuse it on subsequent turns.
+  let sandbox: Sandbox | undefined;
+  const getSandbox = async (): Promise<Sandbox> => {
+    if (!sandbox) {
+      if (!sandboxFactory) {
+        throw new Error(
+          "no SandboxFactory provided to runAgentLoop — bash and other sandboxed tools cannot run",
+        );
+      }
+      sandbox = await sandboxFactory.create();
+    }
+    return sandbox;
+  };
 
   // Mark session as running
   await updateSessionStatus(sessionId, "running");
@@ -538,7 +789,7 @@ export async function runAgentLoop(
         const toolResult = await executeBuiltinTool(
           toolUse.name!,
           toolUse.input ?? {},
-          mcpRoutes,
+          { mcpRoutes, getSandbox },
         );
 
         // Store tool result
@@ -586,6 +837,10 @@ export async function runAgentLoop(
       {},
     );
     emitter?.emit(terminatedEvent);
+  } finally {
+    if (sandbox) {
+      await sandbox.destroy();
+    }
   }
 }
 
