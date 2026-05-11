@@ -128,13 +128,16 @@ export interface ProviderConfig {
 // the provider has a live /models endpoint we can query (Ollama below).
 
 const DEFAULT_MODELS: Record<ProviderType, string[]> = {
+  // Synced 2026-05 against the Anthropic /v1/models endpoint. Older
+  // aliases (`claude-3-5-sonnet-latest`, undated `claude-haiku-4-5`,
+  // etc.) 404 from the messages endpoint and are intentionally omitted
+  // — the dropdown should only offer model IDs that actually resolve.
   anthropic: [
-    "claude-opus-4-5",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
     "claude-sonnet-4-6",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5",
-    "claude-3-5-sonnet-latest",
-    "claude-3-5-haiku-latest",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
   ],
   openai: [
     "gpt-5",

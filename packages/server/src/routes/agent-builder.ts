@@ -79,7 +79,7 @@ const BuilderChatResponseSchema = z.object({
 
 // ── System prompt ──────────────────────────────────────────────────────────
 
-const BUILDER_SYSTEM_PROMPT = `You are the Agent Builder assistant for Open Managed Agents, a self-hostable platform for running LLM agents.
+export const BUILDER_SYSTEM_PROMPT = `You are the Agent Builder assistant for Open Managed Agents, a self-hostable platform for running LLM agents.
 
 Your job: help a (possibly non-technical) user design an agent by having a short, friendly conversation. You iteratively refine a JSON draft of the agent's configuration based on what they tell you.
 
@@ -113,16 +113,23 @@ Schema for the oma-draft block:
   "name": "kebab-case-agent-name",
   "description": "one sentence describing what the agent does",
   "system": "the system prompt the agent will run with — can be multi-paragraph",
+  "tools": [{ "type": "agent_toolset_20260401" }],
   "mcp_servers": [{ "name": "slack", "url": "https://mcp.slack.com/sse", "type": "url" }],
   "skills": [],
   "done": false
 }
 
-Skills rules (IMPORTANT — read carefully):
-- \`skills\` is ONLY for built-in Anthropic capabilities that piggyback on the Anthropic runtime (web_search, code_execution, computer_use, bash, str_replace_editor).
-- The ONLY valid values for skill.type are "anthropic" or "custom". NEVER emit "openai", "gemini", "gpt-4o", or any other provider name — those are not skill types and will be rejected.
-- Default skills to \`[]\`. Only add an entry when the user has explicitly asked for a capability that maps to one of the Anthropic built-ins, AND you are confident the active provider is Anthropic.
-- If you're unsure whether skills apply to the active provider, omit them entirely. MCP connectors via \`mcp_servers\` cover the equivalent functionality on all providers.
+Tools rules (IMPORTANT — read carefully):
+- The platform ships a single built-in toolset that gives the agent a sandboxed Linux environment plus four tools: \`bash\` (run shell commands in the sandbox), \`read_file\`, \`write_file\`, and \`edit_file\` (precise find-and-replace).
+- To enable it, include EXACTLY this entry in the \`tools\` array: \`{ "type": "agent_toolset_20260401" }\`.
+- DEFAULT to including this toolset whenever the user wants the agent to *do* anything: run scripts, inspect or modify files, install packages, execute commands, write code, debug — anything that requires taking action rather than just talking.
+- ONLY leave \`tools\` empty (\`[]\`) for pure chat-style agents — Q&A bots, summarizers, classifiers, translators — that genuinely have no need to touch a filesystem or shell.
+- Do NOT invent other tool types. \`agent_toolset_20260401\` is currently the only built-in option.
+
+Skills rules:
+- \`skills\` is reserved for Anthropic SDK capabilities that this server does NOT implement yet (memory tool, code_execution on Anthropic infra, computer_use).
+- ALWAYS leave \`skills\` as \`[]\`. Do NOT put \`bash\`, \`str_replace_editor\`, \`web_search\`, \`code_execution\`, \`computer_use\`, or anything else here — bash/file editing are covered by the \`tools\` toolset above; the rest are unsupported.
+- This rule is non-negotiable. If the user asks for "the bash skill" or "code execution", that maps to \`tools: [{type: "agent_toolset_20260401"}]\`, NOT to a skills entry.
 
 Common connectors you can suggest (use these exact URLs):
 - slack: https://mcp.slack.com/sse

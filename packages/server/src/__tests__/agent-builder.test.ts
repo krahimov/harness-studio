@@ -363,3 +363,42 @@ describe("POST /v1/agent-builder/chat", () => {
     expect(body.done).toBe(false);
   });
 });
+
+describe("BUILDER_SYSTEM_PROMPT content", () => {
+  // Regression guard for the 2026-05 QA finding: the builder was
+  // telling the LLM that bash + str_replace_editor are Anthropic
+  // "skills", which produced draft YAML with a `skills:` block and
+  // NO `tools:` field. Created agents had zero functional tools
+  // because resolveTools() only enables the built-in toolset when
+  // the agent config contains tools: [{type: "agent_toolset_20260401"}].
+  //
+  // The prompt now (a) instructs the LLM to populate `tools` with
+  // agent_toolset_20260401 whenever the agent needs to take action,
+  // and (b) tells it to always leave skills empty.
+  it("instructs the LLM to emit tools.agent_toolset_20260401, not the skills hallucination", async () => {
+    const { BUILDER_SYSTEM_PROMPT } = await import(
+      "../routes/agent-builder.js"
+    );
+
+    // (a) The toolset must be named.
+    expect(BUILDER_SYSTEM_PROMPT).toContain("agent_toolset_20260401");
+
+    // (b) The schema example must show tools wired up with the toolset.
+    expect(BUILDER_SYSTEM_PROMPT).toMatch(
+      /"tools"\s*:\s*\[\s*\{\s*"type"\s*:\s*"agent_toolset_20260401"\s*\}/,
+    );
+
+    // (c) Explicit instruction to never put bash/str_replace_editor
+    //     under skills — these were the two specific entries the
+    //     pre-fix prompt listed as legitimate "Anthropic capabilities"
+    //     and the LLM dutifully copied into the draft.
+    expect(BUILDER_SYSTEM_PROMPT).toMatch(/leave\s+`?skills`?\s+as\s+`?\[\]`?/i);
+    // The whole "Skills rules" guidance must NOT enumerate bash or
+    // str_replace_editor as legitimate skill values. The fix's negative
+    // mention (telling the LLM "do NOT put bash") is fine — but no
+    // wording that LISTS them as Anthropic-built-in skills.
+    expect(BUILDER_SYSTEM_PROMPT).not.toMatch(
+      /Anthropic[^.]{0,80}built-?in[^.]{0,200}\bbash\b/i,
+    );
+  });
+});
