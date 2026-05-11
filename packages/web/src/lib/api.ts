@@ -382,6 +382,21 @@ export function disconnectMCPConnector(id: string) {
   });
 }
 
+/**
+ * Begin the OAuth authorization-code dance for an MCP connector.
+ * Returns the provider's authorize URL — the UI should navigate
+ * the user there (same-window or popup). The server has already
+ * stored the transient state row by the time this resolves.
+ */
+export function startMCPOAuth(id: string, redirectAfter?: string) {
+  const params = redirectAfter
+    ? `?${new URLSearchParams({ redirect_after: redirectAfter }).toString()}`
+    : "";
+  return request<{ authorize_url: string; state: string }>(
+    `/mcp/connectors/${id}/oauth/authorize${params}`,
+  );
+}
+
 // ── Governance (orgs / teams / users / policies) ───────────────────────
 // Previously Settings hit these endpoints with raw `fetch(...).then(r =>
 // r.json())`, which silently swallowed 401s — the error body landed as

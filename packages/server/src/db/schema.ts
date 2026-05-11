@@ -222,16 +222,39 @@ export async function initSchema(db: DbAdapter) {
     // (organization, connector_id). The token is stored encrypted
     // via lib/encryption (AES-256-GCM) and only decrypted inside the
     // session engine just before it hits the MCP server.
+    //
+    // refresh_token_encrypted + expires_at are populated for OAuth
+    // connectors when the provider returns them. Bearer-token
+    // connectors leave both NULL.
     `CREATE TABLE IF NOT EXISTS mcp_connections (
       id ${TEXT} PRIMARY KEY,
       organization_id ${TEXT} NOT NULL,
       connector_id ${TEXT} NOT NULL,
       auth_type ${TEXT} NOT NULL,
       token_encrypted ${TEXT} NOT NULL,
+      refresh_token_encrypted ${TEXT},
+      expires_at ${TEXT},
       created_by_user_id ${TEXT},
       created_at ${TEXT} NOT NULL DEFAULT (${NOW}),
       updated_at ${TEXT} NOT NULL DEFAULT (${NOW}),
       UNIQUE(organization_id, connector_id)
+    )`,
+
+    // Transient state for the OAuth authorization code dance. A row
+    // is created when the user kicks off /oauth/authorize and consumed
+    // (then deleted) by /oauth/callback. Rows older than the TTL are
+    // GC'd on each authorize call. Keeping this in the DB rather than
+    // an in-memory Map means an in-flight handshake survives a server
+    // restart.
+    `CREATE TABLE IF NOT EXISTS oauth_states (
+      state ${TEXT} PRIMARY KEY,
+      connector_id ${TEXT} NOT NULL,
+      organization_id ${TEXT} NOT NULL,
+      user_id ${TEXT},
+      code_verifier ${TEXT},
+      redirect_after ${TEXT},
+      created_at ${TEXT} NOT NULL DEFAULT (${NOW}),
+      expires_at ${TEXT} NOT NULL
     )`,
   ];
 
@@ -272,6 +295,37 @@ export async function initSchema(db: DbAdapter) {
   // mistral / groq provider types. SQLite can't ALTER-DROP a CHECK
   // constraint, so we detect and rebuild the table. Postgres keeps
   // the looser definition via CREATE TABLE IF NOT EXISTS.
+  // Migrate existing mcp_connections rows to add the OAuth columns.
+  // SQLite has no IF NOT EXISTS for ADD COLUMN, so we probe first.
+  // Postgres has ADD COLUMN IF NOT EXISTS natively.
+  try {
+    if (db.dialect === "sqlite") {
+      const cols = await db.all<{ name: string }>(
+        "PRAGMA table_info(mcp_connections)",
+      );
+      const names = new Set(cols.map((c) => c.name));
+      if (!names.has("refresh_token_encrypted")) {
+        await db.exec(
+          "ALTER TABLE mcp_connections ADD COLUMN refresh_token_encrypted TEXT",
+        );
+      }
+      if (!names.has("expires_at")) {
+        await db.exec(
+          "ALTER TABLE mcp_connections ADD COLUMN expires_at TEXT",
+        );
+      }
+    } else {
+      await db.exec(
+        "ALTER TABLE mcp_connections ADD COLUMN IF NOT EXISTS refresh_token_encrypted TEXT",
+      );
+      await db.exec(
+        "ALTER TABLE mcp_connections ADD COLUMN IF NOT EXISTS expires_at TEXT",
+      );
+    }
+  } catch {
+    // Non-fatal — fresh installs already get the columns from CREATE.
+  }
+
   if (db.dialect === "sqlite") {
     try {
       const row = await db.get<{ sql: string }>(

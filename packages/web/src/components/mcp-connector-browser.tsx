@@ -66,6 +66,32 @@ export function MCPConnectorBrowser({
     }
   };
 
+  /**
+   * Begin the OAuth dance for an `auth_type: "oauth"` connector.
+   * Server returns the provider's authorize URL; we navigate the
+   * user's current tab there. On callback the server redirects
+   * them back to this page with `?oauth_success=1&oauth_connector=…`
+   * (or `?oauth_error=…`) — handled by the toast effect below.
+   */
+  const handleOAuthConnect = async () => {
+    if (!connectTarget) return;
+    setConnectBusy(true);
+    setConnectError(null);
+    try {
+      const { authorize_url } = await api.startMCPOAuth(
+        connectTarget.id,
+        window.location.pathname + window.location.search,
+      );
+      window.location.href = authorize_url;
+    } catch (err: any) {
+      setConnectError(
+        err?.message ??
+          "Failed to start OAuth — make sure the server has client credentials configured for this connector.",
+      );
+      setConnectBusy(false);
+    }
+  };
+
   const handleDisconnect = async (connector: api.MCPConnector) => {
     try {
       await api.disconnectMCPConnector(connector.id);
@@ -224,43 +250,72 @@ export function MCPConnectorBrowser({
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <label className="mt-4 block">
-              <span className="text-xs font-medium text-text-secondary">
-                {connectTarget.auth_type === "oauth"
-                  ? "Access token (use a personal access token until OAuth lands)"
-                  : "API token"}
-              </span>
-              <input
-                type="password"
-                autoFocus
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-                placeholder={`Paste your ${connectTarget.name} token…`}
-                className="mt-1 w-full rounded-md border border-surface-border bg-surface-secondary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-blue focus:outline-none"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleConnect();
-                }}
-              />
-            </label>
-            {connectError && (
-              <p className="mt-2 text-xs text-red-600">{connectError}</p>
+            {connectTarget.auth_type === "oauth" ? (
+              <>
+                <p className="mt-4 text-xs text-text-secondary">
+                  You'll be redirected to {connectTarget.name} to approve
+                  access. After you approve, you'll come back here and
+                  this connector will be marked connected.
+                </p>
+                {connectError && (
+                  <p className="mt-2 text-xs text-red-600">{connectError}</p>
+                )}
+                <div className="mt-4 flex items-center justify-end gap-2">
+                  <Button
+                    variant="ghost"
+                    onClick={() => setConnectTarget(null)}
+                    disabled={connectBusy}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="primary"
+                    onClick={handleOAuthConnect}
+                    disabled={connectBusy}
+                  >
+                    {connectBusy ? "Redirecting…" : `Connect with ${connectTarget.name}`}
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <label className="mt-4 block">
+                  <span className="text-xs font-medium text-text-secondary">
+                    API token
+                  </span>
+                  <input
+                    type="password"
+                    autoFocus
+                    value={tokenInput}
+                    onChange={(e) => setTokenInput(e.target.value)}
+                    placeholder={`Paste your ${connectTarget.name} token…`}
+                    className="mt-1 w-full rounded-md border border-surface-border bg-surface-secondary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-blue focus:outline-none"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleConnect();
+                    }}
+                  />
+                </label>
+                {connectError && (
+                  <p className="mt-2 text-xs text-red-600">{connectError}</p>
+                )}
+                <div className="mt-4 flex items-center justify-end gap-2">
+                  <Button
+                    variant="ghost"
+                    onClick={() => setConnectTarget(null)}
+                    disabled={connectBusy}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="primary"
+                    onClick={handleConnect}
+                    disabled={!tokenInput.trim() || connectBusy}
+                  >
+                    {connectBusy ? "Saving…" : "Save credential"}
+                  </Button>
+                </div>
+              </>
             )}
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <Button
-                variant="ghost"
-                onClick={() => setConnectTarget(null)}
-                disabled={connectBusy}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="primary"
-                onClick={handleConnect}
-                disabled={!tokenInput.trim() || connectBusy}
-              >
-                {connectBusy ? "Saving…" : "Save credential"}
-              </Button>
-            </div>
           </div>
         </div>
       )}

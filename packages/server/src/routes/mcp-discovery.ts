@@ -19,7 +19,7 @@ interface MCPConnector {
   auth_type: "oauth" | "token" | "none";
 }
 
-const CONNECTORS: MCPConnector[] = [
+export const CONNECTORS: MCPConnector[] = [
   {
     id: "slack",
     name: "Slack",

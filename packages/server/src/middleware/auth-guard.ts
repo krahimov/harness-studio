@@ -34,6 +34,12 @@ const PUBLIC_PATHS: Array<RegExp> = [
   /^\/v1\/auth\/logout$/,
   /^\/v1\/auth\/me$/, // intentionally public — returns {user: null} when unauth'd
   /^\/v1\/auth\/sso-providers$/,
+  // OAuth callback is hit by the provider's 302 redirect (Notion etc.).
+  // The user's browser session cookie SHOULD still be attached, but
+  // edge cases (third-party-cookie restrictions, fresh login) can
+  // strip it. State validation (oauth_states row) is the actual
+  // security boundary on this route, so it's safe to leave it public.
+  /^\/v1\/mcp\/connectors\/[^/]+\/oauth\/callback$/,
 ];
 
 function isPublic(path: string): boolean {

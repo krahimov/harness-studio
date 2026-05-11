@@ -16,6 +16,7 @@ import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerVaultRoutes } from "./routes/vaults.js";
 import { registerMCPDiscoveryRoutes } from "./routes/mcp-discovery.js";
+import { registerMCPOAuthRoutes } from "./routes/mcp-oauth.js";
 import {
   registerProviderRoutes,
   seedDefaultProviders,
@@ -98,6 +99,7 @@ export async function createApp(
   registerEventRoutes(app);
   registerVaultRoutes(app);
   registerMCPDiscoveryRoutes(app);
+  registerMCPOAuthRoutes(app);
   registerGovernanceRoutes(app);
   registerUsageRoutes(app);
   registerAuthRoutes(app);
