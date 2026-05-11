@@ -107,7 +107,12 @@ export function getOAuthCredentials(
 }
 
 export function getCallbackBaseUrl(): string {
-  return process.env.OAUTH_CALLBACK_BASE_URL ?? "http://localhost:3001";
+  // Defaults to the dev web origin so the OAuth provider's 302 lands
+  // back on the user's current page (vite proxies /v1/* to the
+  // server). If you point this at the server's own port, the server
+  // will process the callback fine but the subsequent redirect to
+  // /quickstart resolves on the server origin and 404s.
+  return process.env.OAUTH_CALLBACK_BASE_URL ?? "http://localhost:5173";
 }
 
 export function buildCallbackUrl(connectorId: string): string {

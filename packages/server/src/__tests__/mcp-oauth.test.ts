@@ -24,7 +24,7 @@ process.env.AUTH_ENABLED = "false";
 process.env.VAULT_ENCRYPTION_KEY = randomBytes(32).toString("hex");
 process.env.NOTION_OAUTH_CLIENT_ID = "test_client_id";
 process.env.NOTION_OAUTH_CLIENT_SECRET = "test_client_secret";
-process.env.OAUTH_CALLBACK_BASE_URL = "http://localhost:3001";
+process.env.OAUTH_CALLBACK_BASE_URL = "http://localhost:5173";
 
 const { createApp } = await import("../app.js");
 const { getDB } = await import("../db/index.js");
@@ -69,7 +69,7 @@ describe("GET /v1/mcp/connectors/:id/oauth/authorize", () => {
     expect(url.searchParams.get("state")).toBe(body.state);
     expect(url.searchParams.get("owner")).toBe("user");
     expect(url.searchParams.get("redirect_uri")).toBe(
-      "http://localhost:3001/v1/mcp/connectors/notion/oauth/callback",
+      "http://localhost:5173/v1/mcp/connectors/notion/oauth/callback",
     );
 
     const db = await getDB();
@@ -202,7 +202,7 @@ describe("GET /v1/mcp/connectors/:id/oauth/callback", () => {
     expect(sentBody.grant_type).toBe("authorization_code");
     expect(sentBody.code).toBe("auth-code-1");
     expect(sentBody.redirect_uri).toBe(
-      "http://localhost:3001/v1/mcp/connectors/notion/oauth/callback",
+      "http://localhost:5173/v1/mcp/connectors/notion/oauth/callback",
     );
   });
 
