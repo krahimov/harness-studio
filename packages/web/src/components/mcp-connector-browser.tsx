@@ -85,10 +85,17 @@ export function MCPConnectorBrowser({
       <div className="relative">
         <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-muted" />
         <input
-          type="text"
+          type="search"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search connectors..."
+          // Browser autofill in Chrome was happily stuffing the user's
+          // signed-in email into this box on /quickstart, filtering the
+          // entire 16-connector catalog to nothing. type=search +
+          // autoComplete=off + a unique name keep the heuristic away.
+          name="connector-search-filter"
+          autoComplete="off"
+          spellCheck={false}
           className="w-full rounded-md border border-surface-border bg-surface-secondary py-1.5 pl-8 pr-3 text-xs text-text-primary placeholder:text-text-muted focus:border-accent-blue focus:outline-none"
         />
       </div>
