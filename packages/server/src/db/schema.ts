@@ -256,6 +256,26 @@ export async function initSchema(db: DbAdapter) {
       created_at ${TEXT} NOT NULL DEFAULT (${NOW}),
       expires_at ${TEXT} NOT NULL
     )`,
+
+    // Per-organization, per-connector OAuth client registration with
+    // the MCP server. Each MCP server advertises its OAuth metadata at
+    // /.well-known/oauth-authorization-server (RFC 8414). We dynamically
+    // register (RFC 7591) once per (org, connector) and cache the
+    // returned client_id + endpoints here so subsequent connects skip
+    // re-registration. client_secret is encrypted at rest; for public
+    // clients (PKCE-only) it's NULL.
+    `CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+      id ${TEXT} PRIMARY KEY,
+      organization_id ${TEXT} NOT NULL,
+      connector_id ${TEXT} NOT NULL,
+      client_id ${TEXT} NOT NULL,
+      client_secret_encrypted ${TEXT},
+      authorization_endpoint ${TEXT} NOT NULL,
+      token_endpoint ${TEXT} NOT NULL,
+      registration_endpoint ${TEXT},
+      created_at ${TEXT} NOT NULL DEFAULT (${NOW}),
+      UNIQUE(organization_id, connector_id)
+    )`,
   ];
 
   const indexes: string[] = [

@@ -1,20 +1,20 @@
 /**
- * OAuth authorization-code routes for MCP connectors.
+ * OAuth routes for MCP connectors — discovery + dynamic-registration path.
  *
- * Two endpoints per connector:
- *   GET /v1/mcp/connectors/:connectorId/oauth/authorize?redirect_after=...
- *       Generates state + (optional) PKCE, stores them in oauth_states,
- *       302-redirects to the provider's authorize URL.
+ * No per-provider env vars needed: the server discovers each MCP
+ * server's OAuth endpoints from `.well-known/oauth-authorization-server`
+ * (RFC 8414), dynamically registers OMA as a client (RFC 7591), and
+ * runs authorization-code + PKCE against the discovered endpoints.
+ *
+ *   GET /v1/mcp/connectors/:connectorId/oauth/authorize?redirect_after=…
+ *       Discover + register (cached after first call), generate state +
+ *       PKCE verifier, persist them in oauth_states, return the
+ *       authorize URL the UI should send the user to.
  *
  *   GET /v1/mcp/connectors/:connectorId/oauth/callback?code=&state=
- *       Receives the provider redirect, validates state, exchanges code
- *       for tokens, encrypts + stores in mcp_connections, deletes the
- *       state row, redirects the user back to redirect_after (or a
- *       default success page).
- *
- * Errors on /authorize return a 4xx JSON to the caller. Errors on
- * /callback redirect back to the UI with ?oauth_error=… so the user
- * gets a visible toast instead of a raw 500.
+ *       Look up state, exchange code at the discovered token endpoint,
+ *       encrypt + store tokens, redirect the user back to redirect_after
+ *       with ?oauth_success=1 or ?oauth_error=… .
  */
 
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
@@ -24,25 +24,26 @@ import { currentUser } from "../lib/current-user.js";
 import { auditLog } from "./governance.js";
 import { CONNECTORS } from "./mcp-discovery.js";
 import {
-  OAUTH_PROVIDERS,
-  getOAuthCredentials,
   buildCallbackUrl,
-  buildAuthorizeUrl,
   generateState,
   generatePKCE,
-  exchangeCodeForToken,
-  OAuthError,
 } from "../lib/oauth.js";
+import {
+  getOrCreateOAuthClient,
+  buildDiscoveredAuthorizeUrl,
+  exchangeCodeAtDiscoveredEndpoint,
+  loadCachedClient,
+  OAuthDiscoveryError,
+} from "../lib/mcp-oauth-discovery.js";
 
 const tags = ["MCP OAuth"];
 
-const STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const STATE_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_UI_REDIRECT = "/quickstart";
 
 // ── Schemas ────────────────────────────────────────────────────────────────
 
 const AuthorizeQuerySchema = z.object({
-  /** Optional UI path the user is sent back to on success. Defaults to /quickstart. */
   redirect_after: z.string().optional(),
 });
 
@@ -65,7 +66,7 @@ const authorizeRoute = createRoute({
   path: "/v1/mcp/connectors/{connectorId}/oauth/authorize",
   tags,
   summary:
-    "Begin the OAuth authorization-code dance for an MCP connector. Returns the authorize URL the UI should open.",
+    "Begin the OAuth dance for an MCP connector. Discovers + registers with the MCP server's OAuth provider (RFC 8414 + 7591), then returns the authorize URL.",
   request: {
     params: z.object({ connectorId: z.string() }),
     query: AuthorizeQuerySchema,
@@ -74,6 +75,16 @@ const authorizeRoute = createRoute({
     200: {
       description: "Authorize URL ready",
       content: { "application/json": { schema: AuthorizeResponseSchema } },
+    },
+    400: {
+      description: "Connector is not an OAuth connector",
+      content: {
+        "application/json": {
+          schema: z.object({
+            error: z.object({ type: z.string(), message: z.string() }),
+          }),
+        },
+      },
     },
     404: {
       description: "Unknown connector",
@@ -86,7 +97,7 @@ const authorizeRoute = createRoute({
       },
     },
     503: {
-      description: "OAuth client credentials not configured for this connector",
+      description: "OAuth discovery or registration failed for this MCP server",
       content: {
         "application/json": {
           schema: z.object({
@@ -103,15 +114,13 @@ const callbackRoute = createRoute({
   path: "/v1/mcp/connectors/{connectorId}/oauth/callback",
   tags,
   summary:
-    "Receive the OAuth provider callback, exchange code for tokens, store the connection.",
+    "Receive the MCP server's OAuth callback, exchange code for tokens, persist the connection.",
   request: {
     params: z.object({ connectorId: z.string() }),
     query: CallbackQuerySchema,
   },
   responses: {
-    302: {
-      description: "Redirect back to the UI (success or error toast)",
-    },
+    302: { description: "Redirect back to the UI (success or error toast)" },
   },
 });
 
@@ -143,31 +152,15 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
         404,
       );
     }
-
-    const provider = OAUTH_PROVIDERS[connectorId];
-    if (!provider) {
+    if (connector.auth_type !== "oauth") {
       return c.json(
         {
           error: {
-            type: "oauth_not_supported",
-            message: `Connector ${connectorId} is not configured for OAuth in this build`,
+            type: "not_an_oauth_connector",
+            message: `Connector ${connectorId} uses ${connector.auth_type} auth, not OAuth`,
           },
         },
-        503,
-      );
-    }
-
-    const credentials = getOAuthCredentials(connectorId);
-    if (!credentials) {
-      const upper = connectorId.toUpperCase();
-      return c.json(
-        {
-          error: {
-            type: "oauth_credentials_missing",
-            message: `Set ${upper}_OAUTH_CLIENT_ID and ${upper}_OAUTH_CLIENT_SECRET in the server env to enable ${connectorId} OAuth.`,
-          },
-        },
-        503,
+        400,
       );
     }
 
@@ -178,8 +171,40 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
     const nowIso = now.toISOString();
     await gcExpiredStates(nowIso);
 
+    const redirectUri = buildCallbackUrl(connectorId);
+    const clientName = `Open Managed Agents (${organizationId})`;
+
+    let oauthClient;
+    try {
+      oauthClient = await getOrCreateOAuthClient({
+        organizationId,
+        connectorId,
+        mcpServerUrl: connector.url,
+        redirectUri,
+        clientName,
+      });
+    } catch (err) {
+      const msg =
+        err instanceof OAuthDiscoveryError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      return c.json(
+        {
+          error: {
+            type: "oauth_discovery_failed",
+            message: msg,
+          },
+        },
+        503,
+      );
+    }
+
+    // Generate state. PKCE is required for public clients
+    // (clientSecret = undefined); recommended otherwise.
     const state = generateState();
-    const pkce = provider.pkce ? generatePKCE() : null;
+    const pkce = generatePKCE();
     const expiresAt = new Date(now.getTime() + STATE_TTL_MS).toISOString();
 
     const db = await getDB();
@@ -190,19 +215,18 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
       connectorId,
       organizationId,
       user?.id ?? null,
-      pkce?.verifier ?? null,
+      pkce.verifier,
       redirect_after ?? DEFAULT_UI_REDIRECT,
       nowIso,
       expiresAt,
     );
 
-    const redirectUri = buildCallbackUrl(connectorId);
-    const authorizeUrl = buildAuthorizeUrl({
-      provider,
-      clientId: credentials.clientId,
+    const authorizeUrl = buildDiscoveredAuthorizeUrl({
+      authorizationEndpoint: oauthClient.authorizationEndpoint,
+      clientId: oauthClient.clientId,
       redirectUri,
       state,
-      codeChallenge: pkce?.challenge,
+      codeChallenge: pkce.challenge,
     });
 
     return c.json({ authorize_url: authorizeUrl, state }, 200);
@@ -218,11 +242,9 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
         oauth_error_message: msg.slice(0, 200),
         oauth_connector: connectorId,
       });
-      const url = `${fallback}?${params.toString()}`;
-      return c.redirect(url, 302);
+      return c.redirect(`${fallback}?${params.toString()}`, 302);
     };
 
-    // 1. Provider returned an error in the redirect
     if (error) {
       return fail(
         error,
@@ -233,25 +255,7 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
       return fail("missing_params", "OAuth callback missing code or state");
     }
 
-    const provider = OAUTH_PROVIDERS[connectorId];
-    if (!provider) {
-      return fail(
-        "oauth_not_supported",
-        `Connector ${connectorId} is not configured for OAuth in this build`,
-      );
-    }
-
-    const credentials = getOAuthCredentials(connectorId);
-    if (!credentials) {
-      return fail(
-        "oauth_credentials_missing",
-        `Server env vars missing for ${connectorId}`,
-      );
-    }
-
-    // 2. Look up + consume the state row
     const db = await getDB();
-    const nowIso = new Date().toISOString();
     const stateRow = await db.get<{
       connector_id: string;
       organization_id: string;
@@ -263,69 +267,69 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
       "SELECT connector_id, organization_id, user_id, code_verifier, redirect_after, expires_at FROM oauth_states WHERE state = ?",
       state,
     );
-
     if (!stateRow) {
-      return fail(
-        "invalid_state",
-        "OAuth state not found or already consumed",
-      );
+      return fail("invalid_state", "OAuth state not found or already consumed");
     }
-    // Consume the state immediately so a replay is rejected.
+    // Consume immediately to reject replays.
     await db.run("DELETE FROM oauth_states WHERE state = ?", state);
 
-    if (stateRow.expires_at < nowIso) {
+    const fallbackUi = stateRow.redirect_after ?? DEFAULT_UI_REDIRECT;
+    if (stateRow.expires_at < new Date().toISOString()) {
       return fail(
         "state_expired",
         "OAuth handshake took too long — try again",
-        stateRow.redirect_after ?? DEFAULT_UI_REDIRECT,
+        fallbackUi,
       );
     }
     if (stateRow.connector_id !== connectorId) {
       return fail(
         "connector_mismatch",
         "OAuth state was for a different connector",
-        stateRow.redirect_after ?? DEFAULT_UI_REDIRECT,
+        fallbackUi,
       );
     }
 
-    // 3. Exchange the code for tokens
+    const cached = await loadCachedClient(stateRow.organization_id, connectorId);
+    if (!cached) {
+      return fail(
+        "client_not_registered",
+        "No registered OAuth client found — re-initiate the connect flow",
+        fallbackUi,
+      );
+    }
+
     const redirectUri = buildCallbackUrl(connectorId);
+
     let exchangeResult;
     try {
-      exchangeResult = await exchangeCodeForToken({
-        provider,
-        credentials,
+      exchangeResult = await exchangeCodeAtDiscoveredEndpoint({
+        tokenEndpoint: cached.tokenEndpoint,
+        client: cached,
         code,
         redirectUri,
         codeVerifier: stateRow.code_verifier ?? undefined,
       });
     } catch (err) {
       const msg =
-        err instanceof OAuthError
+        err instanceof OAuthDiscoveryError
           ? err.message
           : err instanceof Error
             ? err.message
             : String(err);
-      return fail(
-        "token_exchange_failed",
-        msg,
-        stateRow.redirect_after ?? DEFAULT_UI_REDIRECT,
-      );
+      return fail("token_exchange_failed", msg, fallbackUi);
     }
 
-    // 4. UPSERT the connection — same pattern as /connect
+    // Upsert the connection — same pattern as the legacy /connect route.
     await db.run(
       "DELETE FROM mcp_connections WHERE organization_id = ? AND connector_id = ?",
       stateRow.organization_id,
       connectorId,
     );
-
-    const connId = newId("mcpconn");
     await db.run(
       `INSERT INTO mcp_connections
        (id, organization_id, connector_id, auth_type, token_encrypted, refresh_token_encrypted, expires_at, created_by_user_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      connId,
+      newId("mcpconn"),
       stateRow.organization_id,
       connectorId,
       "oauth",
@@ -340,15 +344,13 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
       "connect",
       "mcp_connector",
       connectorId,
-      JSON.stringify({ auth_type: "oauth" }),
+      JSON.stringify({ auth_type: "oauth", method: "discovery+pkce" }),
     );
 
-    // 5. Redirect the user back to the UI with a success flag
     const successParams = new URLSearchParams({
       oauth_success: "1",
       oauth_connector: connectorId,
     });
-    const dest = `${stateRow.redirect_after ?? DEFAULT_UI_REDIRECT}?${successParams.toString()}`;
-    return c.redirect(dest, 302);
+    return c.redirect(`${fallbackUi}?${successParams.toString()}`, 302);
   });
 }
