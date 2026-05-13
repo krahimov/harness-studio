@@ -227,6 +227,11 @@ export function registerMCPOAuthRoutes(app: OpenAPIHono) {
       redirectUri,
       state,
       codeChallenge: pkce.challenge,
+      // Slack / Google Drive / similar gated providers need explicit
+      // scope grants in the authorize URL. Notion and other servers
+      // that grant workspace-wide access at consent time leave this
+      // empty in the catalog.
+      scopes: connector.default_scopes,
     });
 
     return c.json({ authorize_url: authorizeUrl, state }, 200);

@@ -264,8 +264,39 @@ export async function saveCachedClient(opts: {
 }
 
 /**
- * Cache lookup + (on miss) discover + register + cache. Returns
- * everything the routes need to run the OAuth dance.
+ * Resolve pre-registered OAuth client credentials from env vars by
+ * convention. Connector IDs with hyphens (e.g. "google-drive") are
+ * normalized to underscores for the env var name.
+ *   <CONNECTOR>_OAUTH_CLIENT_ID
+ *   <CONNECTOR>_OAUTH_CLIENT_SECRET
+ *
+ * Used for MCP servers that don't support Dynamic Client Registration
+ * (e.g. Slack, Google Drive — they require apps to be registered
+ * out-of-band in the provider's developer console).
+ */
+export function loadStaticCredentials(
+  connectorId: string,
+): RegisteredClient | null {
+  const upper = connectorId.toUpperCase().replace(/-/g, "_");
+  const clientId = process.env[`${upper}_OAUTH_CLIENT_ID`];
+  const clientSecret = process.env[`${upper}_OAUTH_CLIENT_SECRET`];
+  if (!clientId) return null;
+  // clientSecret optional — public client + PKCE servers exist.
+  return { clientId, clientSecret: clientSecret || undefined };
+}
+
+/**
+ * Cache lookup + (on miss) discover → (DCR or static fallback) → cache.
+ *
+ * Two paths converge here:
+ *   - DCR path: the server advertises a registration_endpoint and we
+ *     POST our client metadata to register dynamically (Notion).
+ *   - Static-credentials path: the server doesn't support DCR (Slack,
+ *     Google Drive, …) — the admin pre-registered an app and pasted
+ *     credentials into <CONNECTOR>_OAUTH_CLIENT_ID / _SECRET env vars.
+ *
+ * Returns everything the routes need to build the authorize URL +
+ * exchange the code.
  */
 export async function getOrCreateOAuthClient(opts: {
   organizationId: string;
@@ -276,27 +307,46 @@ export async function getOrCreateOAuthClient(opts: {
 }): Promise<CachedClient & { pkceSupported: boolean }> {
   const cached = await loadCachedClient(opts.organizationId, opts.connectorId);
   if (cached) {
-    // Re-probe pkce support cheaply by checking which methods the
-    // token endpoint supports. We didn't persist that field, so
-    // assume true (PKCE-capable servers are the common case) and
-    // let the actual flow fail loudly if the server rejects it.
+    // PKCE support isn't persisted; assume true (modern MCP servers do)
+    // and let the actual flow fail loudly if the server rejects it.
     return { ...cached, pkceSupported: true };
   }
 
   const metadata = await discoverOAuthServer(opts.mcpServerUrl);
-  if (!metadata.registrationEndpoint) {
-    throw new OAuthDiscoveryError(
-      `MCP server ${opts.mcpServerUrl} does not advertise a registration_endpoint — cannot register dynamically. Pre-registered OAuth apps need to be wired via the legacy OAUTH_PROVIDERS path.`,
-    );
+
+  let client: RegisteredClient | null = null;
+  let dcrError: string | null = null;
+
+  // Try Dynamic Client Registration first if the server advertises it.
+  if (metadata.registrationEndpoint) {
+    try {
+      const authMethod = pickAuthMethod(metadata.tokenAuthMethods);
+      client = await registerOAuthClient({
+        registrationEndpoint: metadata.registrationEndpoint,
+        redirectUri: opts.redirectUri,
+        clientName: opts.clientName,
+        preferredAuthMethod: authMethod,
+      });
+    } catch (err) {
+      dcrError = err instanceof Error ? err.message : String(err);
+      // Fall through to static-credentials lookup.
+    }
   }
 
-  const authMethod = pickAuthMethod(metadata.tokenAuthMethods);
-  const client = await registerOAuthClient({
-    registrationEndpoint: metadata.registrationEndpoint,
-    redirectUri: opts.redirectUri,
-    clientName: opts.clientName,
-    preferredAuthMethod: authMethod,
-  });
+  // Static-credentials fallback.
+  if (!client) {
+    const staticCreds = loadStaticCredentials(opts.connectorId);
+    if (!staticCreds) {
+      const upper = opts.connectorId.toUpperCase().replace(/-/g, "_");
+      const hint = dcrError
+        ? `dynamic registration failed (${dcrError.slice(0, 200)}) and no static credentials found`
+        : `MCP server ${opts.mcpServerUrl} does not support dynamic client registration`;
+      throw new OAuthDiscoveryError(
+        `Cannot register OAuth client for "${opts.connectorId}": ${hint}. Set ${upper}_OAUTH_CLIENT_ID and ${upper}_OAUTH_CLIENT_SECRET env vars with credentials from the provider's developer console.`,
+      );
+    }
+    client = staticCreds;
+  }
 
   await saveCachedClient({
     organizationId: opts.organizationId,

@@ -17,23 +17,47 @@ interface MCPConnector {
   icon: string;
   category: string;
   auth_type: "oauth" | "token" | "none";
+  /**
+   * Scopes requested in the OAuth authorize URL. Required for
+   * providers like Slack that gate functionality behind explicit
+   * scope grants. Some providers (Notion) ignore this and grant
+   * workspace-wide access at consent time — leave empty.
+   */
+  default_scopes?: string[];
 }
 
 export const CONNECTORS: MCPConnector[] = [
   {
     id: "slack",
     name: "Slack",
-    description: "Send messages, read channels, manage workflows in Slack.",
-    url: "https://mcp.slack.com/sse",
+    description: "Send messages, read channels, search workspace history.",
+    // Slack's MCP server is Streamable HTTP only — no SSE support.
+    url: "https://mcp.slack.com/mcp",
     icon: "slack",
     category: "communication",
     auth_type: "oauth",
+    default_scopes: [
+      "search:read.public",
+      "search:read.private",
+      "search:read.mpim",
+      "search:read.im",
+      "search:read.files",
+      "search:read.users",
+      "chat:write",
+      "channels:history",
+      "groups:history",
+      "mpim:history",
+      "im:history",
+      "users:read",
+    ],
   },
   {
     id: "notion",
+    // Notion's recommended endpoint is /mcp (Streamable HTTP).
+    // /sse still works but is the legacy transport.
     name: "Notion",
     description: "Read and write Notion pages, databases, and blocks.",
-    url: "https://mcp.notion.com/sse",
+    url: "https://mcp.notion.com/mcp",
     icon: "notion",
     category: "knowledge-base",
     auth_type: "oauth",
@@ -103,12 +127,21 @@ export const CONNECTORS: MCPConnector[] = [
   },
   {
     id: "google-drive",
+    // Google Drive's MCP server lives on Workspace's drivemcp.googleapis.com
+    // (not mcp.google.com). Requires a Google Cloud project with both
+    // Drive API + Drive MCP API enabled, plus an OAuth consent screen
+    // configured. See .env.example for the env vars to set.
+    // (Note: original placeholder URL was wrong; corrected here.)
     name: "Google Drive",
     description: "Read and write files in Google Drive, Docs, and Sheets.",
-    url: "https://mcp.google.com/drive/sse",
+    url: "https://drivemcp.googleapis.com/mcp/v1",
     icon: "google-drive",
     category: "storage",
     auth_type: "oauth",
+    default_scopes: [
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/drive.file",
+    ],
   },
   {
     id: "postgres",

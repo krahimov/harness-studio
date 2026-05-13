@@ -220,6 +220,153 @@ describe("GET /v1/mcp/connectors/:id/oauth/authorize (discovery + dynamic regist
   });
 });
 
+describe("Static-credentials fallback (Slack-style: discovery without DCR)", () => {
+  it("uses SLACK_OAUTH_CLIENT_ID/SECRET env vars when discovery returns no registration_endpoint, and includes the connector's default_scopes in the authorize URL", async () => {
+    process.env.SLACK_OAUTH_CLIENT_ID = "slack-static-client-id";
+    process.env.SLACK_OAUTH_CLIENT_SECRET = "slack-static-secret";
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          issuer: "https://mcp.slack.com",
+          authorization_endpoint: "https://slack.com/oauth/v2_user/authorize",
+          token_endpoint: "https://slack.com/api/oauth.v2.user.access",
+          // No registration_endpoint — Slack doesn't support DCR.
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code"],
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["client_secret_post"],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const res = await app.request(
+      "/v1/mcp/connectors/slack/oauth/authorize",
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { authorize_url: string };
+
+    const url = new URL(body.authorize_url);
+    expect(url.origin + url.pathname).toBe(
+      "https://slack.com/oauth/v2_user/authorize",
+    );
+    expect(url.searchParams.get("client_id")).toBe("slack-static-client-id");
+    // Scope param includes the connector's default_scopes joined by space.
+    const scope = url.searchParams.get("scope") ?? "";
+    expect(scope).toContain("chat:write");
+    expect(scope).toContain("channels:history");
+    expect(scope).toContain("search:read.public");
+
+    // PKCE active even though it's a confidential client.
+    expect(url.searchParams.get("code_challenge")).toBeTruthy();
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+
+    // Only discovery was called; no /register request was made.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect((fetchSpy.mock.calls[0]![0] as string)).toBe(
+      "https://mcp.slack.com/.well-known/oauth-authorization-server",
+    );
+
+    // Cleanup so other tests don't see these env vars.
+    delete process.env.SLACK_OAUTH_CLIENT_ID;
+    delete process.env.SLACK_OAUTH_CLIENT_SECRET;
+  });
+
+  it("returns 503 with a clear hint when DCR is unsupported AND env vars are missing", async () => {
+    delete process.env.SLACK_OAUTH_CLIENT_ID;
+    delete process.env.SLACK_OAUTH_CLIENT_SECRET;
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          authorization_endpoint: "https://slack.com/oauth/v2_user/authorize",
+          token_endpoint: "https://slack.com/api/oauth.v2.user.access",
+          // no registration_endpoint
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const res = await app.request(
+      "/v1/mcp/connectors/slack/oauth/authorize",
+    );
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as {
+      error: { type: string; message: string };
+    };
+    expect(body.error.type).toBe("oauth_discovery_failed");
+    expect(body.error.message).toContain("SLACK_OAUTH_CLIENT_ID");
+    expect(body.error.message).toContain("SLACK_OAUTH_CLIENT_SECRET");
+  });
+
+  it("normalizes hyphens to underscores in env var lookup (google-drive → GOOGLE_DRIVE_*)", async () => {
+    process.env.GOOGLE_DRIVE_OAUTH_CLIENT_ID = "gdrive-static-id";
+    process.env.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET = "gdrive-static-secret";
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+          token_endpoint: "https://oauth2.googleapis.com/token",
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["client_secret_post"],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const res = await app.request(
+      "/v1/mcp/connectors/google-drive/oauth/authorize",
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { authorize_url: string };
+    const url = new URL(body.authorize_url);
+    expect(url.searchParams.get("client_id")).toBe("gdrive-static-id");
+    // Google Drive default_scopes from the catalog
+    const scope = url.searchParams.get("scope") ?? "";
+    expect(scope).toContain("drive.readonly");
+    expect(scope).toContain("drive.file");
+
+    delete process.env.GOOGLE_DRIVE_OAUTH_CLIENT_ID;
+    delete process.env.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET;
+  });
+
+  it("falls back to static credentials when DCR is advertised but returns a 4xx error", async () => {
+    process.env.NOTION_OAUTH_CLIENT_ID = "notion-static-fallback";
+    process.env.NOTION_OAUTH_CLIENT_SECRET = "notion-static-secret";
+
+    // Discovery doc says DCR is supported …
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          authorization_endpoint: "https://mcp.notion.com/authorize",
+          token_endpoint: "https://mcp.notion.com/token",
+          registration_endpoint: "https://mcp.notion.com/register",
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["client_secret_basic", "none"],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    // … but the registration call returns 403 (e.g. server temporarily refuses).
+    fetchSpy.mockResolvedValueOnce(
+      new Response('{"error":"forbidden"}', { status: 403 }),
+    );
+
+    const res = await app.request(
+      "/v1/mcp/connectors/notion/oauth/authorize",
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { authorize_url: string };
+    const url = new URL(body.authorize_url);
+    expect(url.searchParams.get("client_id")).toBe("notion-static-fallback");
+
+    delete process.env.NOTION_OAUTH_CLIENT_ID;
+    delete process.env.NOTION_OAUTH_CLIENT_SECRET;
+  });
+});
+
 describe("GET /v1/mcp/connectors/:id/oauth/callback", () => {
   async function primeStateAndClient(): Promise<{ state: string }> {
     fetchSpy.mockResolvedValueOnce(mockDiscovery());
